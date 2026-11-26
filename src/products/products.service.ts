@@ -1,5 +1,5 @@
 import { BadRequestException, HttpException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { validate as isUUID } from 'uuid';
 
@@ -17,7 +17,8 @@ export class ProductsService {
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
     @InjectRepository(ProductImage)
-    private readonly productImageRepository: Repository<ProductImage>
+    private readonly productImageRepository: Repository<ProductImage>,
+    private readonly dataSource: DataSource, // conexión a la DB
   ) { }
 
   async create(createProductDto: CreateProductDto) {
@@ -68,11 +69,11 @@ export class ProductsService {
 
       const queryBuilder = this.productRepository.createQueryBuilder('product');
       product = await queryBuilder
+        .leftJoinAndSelect('product.images', 'productImages')
         .where('(UPPER(product.title) = :title OR product.slug = :slug)', {
           title: term.toUpperCase(),
           slug: term.toLowerCase(),
         })
-        .leftJoinAndSelect('product.images', 'productImages')
         .getOne();
     }
 
@@ -96,23 +97,42 @@ export class ProductsService {
     // 1. findOne / findOneBy + merge + save
     // 2. update(id, dto) directo en el repositorio
 
+    const { images, ...toUpdate } = updateProductDto;
+
     // 3.
     const product = await this.productRepository.preload({
-      id: id,
-      ...updateProductDto,
-      images: []
+      id,
+      ...toUpdate
     });
 
     if (!product) {
       throw new NotFoundException(`Product with id: ${id} not foud`);
     }
 
-    try {
-      await this.productRepository.save(product);
+    // create query runner
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-      return product;
+    try {
+
+      if (images) {
+        await queryRunner.manager.delete(ProductImage, { product: { id } });
+        product.images = images.map(image => this.productImageRepository.create({ url: image }));
+      }
+
+      await queryRunner.manager.save(product);
+      await queryRunner.commitTransaction();
+
+      return await this.findOnePlain(id);
+
     } catch (error: unknown) {
+      await queryRunner.rollbackTransaction();
+
       this.handleDBExeptions(error);
+
+    } finally {
+      await queryRunner.release();
     }
   }
 
